@@ -2,6 +2,7 @@ import os
 import re
 import pandas as pd
 from docx import Document
+from docx.oxml.ns import qn
 from bs4 import BeautifulSoup
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -311,7 +312,51 @@ def gerar_resumo(df):
     return df_resumo
 
 
-def salvar_em_excel(df_comparacao, df_resumo, df_elementos, df_imagens, metadados, page_url, nome_arquivo="comparacao_resultado.xlsx"):
+# ---------------------- EXTRAÇÃO DE TEXTO EM NEGRITO ----------------------
+def extract_bold_phrases(doc_path):
+    """Agrupa runs, tabelas e caixas de texto para capturar frases completas em negrito."""
+    doc = Document(doc_path)
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+
+    def runs_to_phrases(runs):
+        texts, curr = [], []
+        for r in runs:
+            rPr = r.find("w:rPr", ns)
+            bold = rPr is not None and rPr.find("w:b", ns) is not None
+            t = r.find("w:t", ns)
+            if bold and t is not None and t.text.strip():
+                curr.append(t.text.strip())
+            else:
+                if curr:
+                    texts.append(" ".join(curr))
+                    curr = []
+        if curr:
+            texts.append(" ".join(curr))
+        return texts
+
+    phrases = []
+    for para in doc.paragraphs:
+        phrases += runs_to_phrases([r._element for r in para.runs])
+    for tbl in doc.tables:
+        for row in tbl.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    phrases += runs_to_phrases([r._element for r in para.runs])
+    for txbx in doc.element.body.findall('.//w:txbxContent', ns):
+        for p in txbx.findall('.//w:p', ns):
+            phrases += runs_to_phrases(p.findall('.//w:r', ns))
+
+    seen, unique = set(), []
+    for ph in phrases:
+        norm = re.sub(r"\s+", " ", ph).strip()
+        if norm and norm not in seen:
+            seen.add(norm)
+            unique.append(norm)
+    return unique
+# ---------------------------------------------------------------------------
+
+
+def salvar_em_excel(df_comparacao, df_resumo, df_elementos, df_imagens, metadados, page_url, nome_arquivo="comparacao_resultado.xlsx", word_path=None):
     wb = Workbook()
 
     def estilizar(ws, colorir=False):
@@ -380,6 +425,36 @@ def salvar_em_excel(df_comparacao, df_resumo, df_elementos, df_imagens, metadado
     for col, width in zip(["A","B","C","D","E"], [50,30,50,30,50]):
         aba5.column_dimensions[col].width = width
 
+    # ---- Nova aba: Italic-Bold Check ----
+    if word_path:
+        bold_list = extract_bold_phrases(word_path)
+        els = df_elementos["Texto"].astype(str).tolist()
+        linhas = [
+            {
+                "From doc": t,
+                "At URL": t if t in els else "",
+                "Status": "Present" if t in els else "Missing",
+            }
+            for t in bold_list
+        ]
+        if linhas:
+            aba6 = wb.create_sheet("Italic-Bold Check")
+            df_bold = pd.DataFrame(linhas)
+            for row in dataframe_to_rows(df_bold, index=False, header=True):
+                aba6.append(row)
+            for cell in aba6[1]:
+                cell.font = Font(bold=True)
+                cell.fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+            for col in aba6.columns:
+                aba6.column_dimensions[col[0].column_letter].width = 40
+            cores_bold = {"Present": "C6EFCE", "Missing": "F8CBAD"}
+            status_idx = 3
+            for row in aba6.iter_rows(min_row=2):
+                status = row[status_idx - 1].value
+                cor = cores_bold.get(status, "FFFFFF")
+                for cell in row:
+                    cell.fill = PatternFill(start_color=cor, end_color=cor, fill_type="solid")
+
     wb.save(nome_arquivo)
 
 # ---------------------- INTERFACE ----------------------
@@ -418,7 +493,14 @@ def comparar_um(root):
         df4 = pd.DataFrame(imagens, columns=["Image URL", "Image Alt"])
         nome = re.sub(r'[\\/:*?"<>|]', '', titulo)[:50]
         salvar_em_excel(
-            df1, df2, df3, df4, meta, url, os.path.join(pasta, f"comparacao_{nome}.xlsx")
+            df1,
+            df2,
+            df3,
+            df4,
+            meta,
+            url,
+            os.path.join(pasta, f"comparacao_{nome}.xlsx"),
+            word_path=docx_path,
         )
         messagebox.showinfo("Sucesso", "Comparação finalizada com sucesso!")
     except Exception as e:
@@ -461,7 +543,14 @@ def comparar_varios(root):
             df4 = pd.DataFrame(imagens, columns=["Image URL", "Image Alt"])
             nome = re.sub(r'[\\/:*?"<>|]', '', titulo)[:50]
             salvar_em_excel(
-                df1, df2, df3, df4, meta, url, os.path.join(pasta, f"comparacao_{nome}.xlsx")
+                df1,
+                df2,
+                df3,
+                df4,
+                meta,
+                url,
+                os.path.join(pasta, f"comparacao_{nome}.xlsx"),
+                word_path=docx_path,
             )
             progress.step(1)
             progress_window.update_idletasks()
